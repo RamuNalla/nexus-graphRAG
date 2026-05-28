@@ -1,120 +1,268 @@
+"""
+Nexus GraphRAG — Agentic Query Router
+======================================
+A ReAct-style agent that routes financial questions to the right tool:
+  • vector_search  — semantic search over Qdrant (facts, figures, summaries)
+  • graph_search   — Cypher queries over Neo4j  (relationships, multi-hop)
+
+No llama-index dependency. Uses direct SDKs — fully Python 3.14 compatible.
+
+Run:
+    python3 src/agents/query_router.py
+    python3 src/agents/query_router.py "What was Apple's revenue?"
+"""
+
 import os
 import sys
+import json
+import re
 import time
-import nest_asyncio
+import textwrap
+from pathlib import Path
 
-# Prevent async event loop issues
-nest_asyncio.apply()
+# ---------------------------------------------------------------------------
+# Path setup
+# ---------------------------------------------------------------------------
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT))
 
-from llama_index.core import Settings, PropertyGraphIndex
-from llama_index.llms.groq import Groq
-from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore
-from llama_index.vector_stores.qdrant import QdrantVectorStore
-from qdrant_client import QdrantClient
-
-from llama_index.core.indices.property_graph import VectorContextRetriever, TextToCypherRetriever
-from llama_index.core.query_engine import RetrieverQueryEngine
-from llama_index.core.tools import QueryEngineTool, ToolMetadata
-from llama_index.core.agent import ReActAgent
-
-# Ensure we can import config
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 from src import config
 
-def initialize_agent():
-    print("1. Initializing Models & Connections...")
-    llm = Groq(model="llama3-70b-8192", api_key=config.GROQ_API_KEY, temperature=0.0)
-    embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-small-en-v1.5")
-    Settings.llm = llm
-    Settings.embed_model = embed_model
+if not config.GROQ_API_KEY:
+    sys.exit("❌ GROQ_API_KEY not set. Copy .env.example → .env and add your key.")
 
-    graph_store = Neo4jPropertyGraphStore(
-        username=config.NEO4J_USERNAME,
-        password=config.NEO4J_PASSWORD,
-        url=config.NEO4J_URI,
-    )
-    
-    qdrant_client = QdrantClient(url=config.QDRANT_URL)
-    vector_store = QdrantVectorStore(client=qdrant_client, collection_name="sec_10k_filings")
+from groq import Groq as GroqClient
+from neo4j import GraphDatabase
+from qdrant_client import QdrantClient
+from fastembed import TextEmbedding
 
-    # Reconnect to our existing index from Phase 2
-    index = PropertyGraphIndex.from_existing(
-        property_graph_store=graph_store,
-        vector_store=vector_store,
-    )
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+LLM_MODEL    = "llama-3.3-70b-versatile"
+EMBED_MODEL  = "BAAI/bge-small-en-v1.5"
+COLLECTION   = "sec_10k_filings"
+MAX_REACT    = 6          # max ReAct iterations before giving up
+GROQ_SLEEP   = 1.5        # seconds between LLM calls (free-tier rate limit)
 
-    print("2. Building Independent Retrieval Tools...")
-    
-    # TOOL 1: Vector Retriever (For simple text lookups)
-    vector_retriever = VectorContextRetriever(
-        graph_store=graph_store,
-        vector_store=vector_store,
-        embed_model=embed_model
-    )
-    vector_query_engine = RetrieverQueryEngine.from_args(vector_retriever, llm=llm)
-    
-    vector_tool = QueryEngineTool(
-        query_engine=vector_query_engine,
-        metadata=ToolMetadata(
-            name="vector_search_tool",
-            description="Use this tool to find direct facts, numerical figures, and standard text summaries from the financial documents (e.g., 'What was the revenue?', 'What are the risk factors?')."
-        )
-    )
+# ---------------------------------------------------------------------------
+# Tool implementations
+# ---------------------------------------------------------------------------
 
-    # TOOL 2: Graph/Cypher Retriever (For multi-hop & relationship lookups)
-    cypher_retriever = TextToCypherRetriever(
-        graph_store=graph_store,
-        llm=llm
+def vector_search(query: str, qdrant: QdrantClient, embedder: TextEmbedding,
+                  top_k: int = 5) -> str:
+    """Semantic similarity search over Qdrant. Returns concatenated text chunks."""
+    vector = list(embedder.embed([query]))[0].tolist()
+    results = qdrant.search(
+        collection_name=COLLECTION,
+        query_vector=vector,
+        limit=top_k,
     )
-    cypher_query_engine = RetrieverQueryEngine.from_args(cypher_retriever, llm=llm)
-    
-    graph_tool = QueryEngineTool(
-        query_engine=cypher_query_engine,
-        metadata=ToolMetadata(
-            name="graph_search_tool",
-            description="Use this tool for relational, structural, or multi-hop queries connecting entities (e.g., 'What companies did Microsoft acquire?', 'How is Entity X connected to Entity Y?')."
-        )
-    )
+    if not results:
+        return "No relevant passages found in the vector store."
+    passages = []
+    for r in results:
+        source = r.payload.get("source", "unknown")
+        text   = r.payload.get("text", "")
+        passages.append(f"[{source}] {text.strip()}")
+    return "\n\n---\n\n".join(passages)
 
-    print("3. Compiling the Agentic Router...")
-    
-    system_prompt = """
-    You are an intelligent financial router agent. You have access to a Vector Database and a Graph Database.
-    Think step-by-step. 
-    First, analyze the user's question to determine its complexity.
-    If it is a simple factual question, use the `vector_search_tool`.
-    If it requires connecting entities, finding relationships, or mapping dependencies, use the `graph_search_tool`.
-    Once you have the observation, summarize the final answer clearly.
+
+def graph_search(query: str, neo4j_driver, groq: GroqClient) -> str:
     """
+    Two-step: ask Groq to write a Cypher query, run it against Neo4j,
+    return the results as a formatted string.
+    """
+    # Step 1 — text-to-Cypher
+    cypher_prompt = textwrap.dedent(f"""\
+        You are a Neo4j Cypher expert. The graph contains nodes with label :Entity
+        and a `name` property. Relationships have descriptive UPPER_SNAKE_CASE types.
 
-    agent = ReActAgent.from_tools(
-        [vector_tool, graph_tool],
-        llm=llm,
-        verbose=True, # This makes the agent print its "Thoughts"
-        system_prompt=system_prompt
+        Write a single Cypher query to answer the following question.
+        Return ONLY the Cypher query, no explanation, no markdown fences.
+
+        Question: {query}
+    """)
+    resp = groq.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[{"role": "user", "content": cypher_prompt}],
+        temperature=0.0,
+        max_tokens=256,
     )
-    
-    return agent
+    cypher = resp.choices[0].message.content.strip()
+    cypher = re.sub(r"^```[a-z]*\n?", "", cypher)
+    cypher = re.sub(r"```$", "", cypher).strip()
+
+    # Step 2 — execute
+    try:
+        with neo4j_driver.session() as session:
+            result = session.run(cypher)
+            rows = [dict(record) for record in result]
+        if not rows:
+            return f"Cypher ran successfully but returned no results.\nQuery: {cypher}"
+        # Serialise neo4j Node/Relationship objects to plain strings
+        def _fmt(v):
+            if hasattr(v, "_properties"):   # Node or Relationship
+                return dict(v._properties)
+            return v
+        formatted = json.dumps([{k: _fmt(v) for k, v in row.items()} for row in rows],
+                                indent=2, default=str)
+        return f"Cypher: {cypher}\n\nResults:\n{formatted}"
+    except Exception as e:
+        return f"Cypher execution error: {e}\nQuery attempted: {cypher}"
+
+
+# ---------------------------------------------------------------------------
+# ReAct agent loop
+# ---------------------------------------------------------------------------
+
+REACT_SYSTEM = textwrap.dedent("""\
+    You are an intelligent financial analysis agent with two tools:
+
+    1. vector_search(query) — semantic search over 10-K filing text passages.
+       Best for: revenue figures, business descriptions, risk factors, plain facts.
+
+    2. graph_search(query) — graph database query over extracted entities & relationships.
+       Best for: connections between entities, subsidiaries, acquisitions, multi-hop lookups.
+
+    Follow this strict format for EVERY response until you have a final answer:
+
+    Thought: <your reasoning about what to do next>
+    Action: <tool name: either "vector_search" or "graph_search">
+    Action Input: <the query string to pass to the tool>
+
+    After you receive an Observation, continue with:
+
+    Thought: <interpret the result>
+    ... (repeat if needed) ...
+
+    When you have enough information, write:
+
+    Thought: I have enough information to answer.
+    Final Answer: <your complete, well-structured answer>
+
+    Rules:
+    - Never make up facts. Only use what the tools return.
+    - Always end with "Final Answer:".
+""")
+
+
+def run_react_agent(question: str, groq: GroqClient, qdrant: QdrantClient,
+                    neo4j_driver, embedder: TextEmbedding) -> str:
+    """Run a ReAct loop: Thought → Action → Observation → … → Final Answer."""
+    messages = [
+        {"role": "system", "content": REACT_SYSTEM},
+        {"role": "user",   "content": question},
+    ]
+
+    for step in range(1, MAX_REACT + 1):
+        time.sleep(GROQ_SLEEP)
+        resp = groq.chat.completions.create(
+            model=LLM_MODEL,
+            messages=messages,
+            temperature=0.0,
+            max_tokens=1024,
+            stop=["Observation:"],   # stop before hallucinating the observation
+        )
+        assistant_msg = resp.choices[0].message.content.strip()
+        print(f"\n--- Step {step} ---\n{assistant_msg}")
+        messages.append({"role": "assistant", "content": assistant_msg})
+
+        # Check for final answer
+        if "Final Answer:" in assistant_msg:
+            final = assistant_msg.split("Final Answer:", 1)[1].strip()
+            return final
+
+        # Parse Action / Action Input
+        action_match = re.search(r"Action:\s*(.+)", assistant_msg)
+        input_match  = re.search(r"Action Input:\s*(.+)", assistant_msg, re.DOTALL)
+
+        if not action_match or not input_match:
+            # Model deviated from format — nudge it
+            messages.append({
+                "role": "user",
+                "content": "Please follow the format: Thought / Action / Action Input, or write Final Answer."
+            })
+            continue
+
+        tool_name  = action_match.group(1).strip().lower().replace(" ", "_")
+        tool_input = input_match.group(1).strip().strip('"').strip("'")
+
+        # Execute tool
+        print(f"\n🔧 Tool: {tool_name}")
+        print(f"   Input: {tool_input}")
+        if "graph" in tool_name:
+            observation = graph_search(tool_input, neo4j_driver, groq)
+        else:
+            observation = vector_search(tool_input, qdrant, embedder)
+
+        print(f"   Observation (first 300 chars): {observation[:300]}…")
+
+        # Feed observation back
+        messages.append({
+            "role": "user",
+            "content": f"Observation: {observation}\n\nContinue your reasoning."
+        })
+
+    return "⚠️  Agent reached maximum steps without a final answer."
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+class FinancialAgent:
+    """Initialise once, then call .chat(question) repeatedly."""
+
+    def __init__(self):
+        print("🔧 Initialising connections…")
+        self.groq    = GroqClient(api_key=config.GROQ_API_KEY)
+        self.neo4j   = GraphDatabase.driver(
+            config.NEO4J_URI,
+            auth=(config.NEO4J_USERNAME, config.NEO4J_PASSWORD),
+        )
+        self.neo4j.verify_connectivity()
+        self.qdrant  = QdrantClient(url=config.QDRANT_URL)
+        self.embedder = TextEmbedding(model_name=EMBED_MODEL)
+        print("   ✅ Groq | Neo4j | Qdrant | fastembed ready")
+
+    def chat(self, question: str) -> str:
+        print(f"\n{'='*56}")
+        print(f"❓  {question}")
+        print(f"{'='*56}")
+        return run_react_agent(
+            question, self.groq, self.qdrant, self.neo4j, self.embedder
+        )
+
+    def close(self):
+        self.neo4j.close()
+
+
+# ---------------------------------------------------------------------------
+# CLI entrypoint
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    agent = initialize_agent()
-    
-    print("\n==================================================")
-    print("TEST 1: Simple Fact Question (Should Route to Vector)")
-    print("==================================================")
-    q1 = "What is the primary business of Apple?"
-    response1 = agent.chat(q1)
-    print(f"\n[FINAL ANSWER]: {response1}\n")
-    
-    # Pause to respect Groq free-tier rate limits
-    print("Waiting 5 seconds to avoid API rate limits...\n")
-    time.sleep(5)
-    
-    print("==================================================")
-    print("TEST 2: Relational/Multi-Hop Question (Should Route to Graph)")
-    print("==================================================")
-    # We ask about Microsoft's relationships/entities which the graph excels at
-    q2 = "What entities or subsidiaries are related to Microsoft?"
-    response2 = agent.chat(q2)
-    print(f"\n[FINAL ANSWER]: {response2}\n")
+    agent = FinancialAgent()
+
+    # Accept a question from the command line, or run the two built-in tests
+    if len(sys.argv) > 1:
+        answer = agent.chat(" ".join(sys.argv[1:]))
+        print(f"\n[FINAL ANSWER]: {answer}\n")
+    else:
+        print("\n" + "="*56)
+        print("TEST 1: Simple Fact  →  should use vector_search")
+        print("="*56)
+        answer1 = agent.chat("What is the primary business of Apple?")
+        print(f"\n[FINAL ANSWER]: {answer1}\n")
+
+        print("Waiting 5 s to respect Groq free-tier rate limits…\n")
+        time.sleep(5)
+
+        print("="*56)
+        print("TEST 2: Relationship  →  should use graph_search")
+        print("="*56)
+        answer2 = agent.chat("What entities or subsidiaries are related to Microsoft?")
+        print(f"\n[FINAL ANSWER]: {answer2}\n")
+
+    agent.close()
