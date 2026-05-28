@@ -72,7 +72,7 @@ CHUNK_SIZE    = 1200          # characters per chunk sent to Groq
 CHUNK_OVERLAP = 200
 MAX_CHUNKS    = int(os.getenv("MAX_CHUNKS", "20"))   # free-tier guard
 EMBED_MODEL   = "BAAI/bge-small-en-v1.5"   # supported natively by fastembed
-LLM_MODEL     = "llama3-70b-8192"
+LLM_MODEL     = "llama-3.3-70b-versatile"  # llama3-70b-8192 was decommissioned
 COLLECTION    = "sec_10k_filings"
 EMBED_DIM     = 384
 
@@ -121,25 +121,25 @@ def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) 
 
 def extract_triples(groq: GroqClient, chunk: str) -> list[dict]:
     """Ask Groq to extract (subject, predicate, object) triples from a chunk."""
+    response = groq.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": chunk},
+        ],
+        temperature=0.0,
+        max_tokens=1024,
+    )
+    raw = response.choices[0].message.content.strip()
+    # Strip accidental markdown fences
+    raw = re.sub(r"^```[a-z]*\n?", "", raw)
+    raw = re.sub(r"```$", "", raw).strip()
     try:
-        response = groq.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": chunk},
-            ],
-            temperature=0.0,
-            max_tokens=1024,
-        )
-        raw = response.choices[0].message.content.strip()
-        # Strip accidental markdown fences
-        raw = re.sub(r"^```[a-z]*\n?", "", raw)
-        raw = re.sub(r"```$", "", raw).strip()
         triples = json.loads(raw)
         if isinstance(triples, list):
             return triples
-    except (json.JSONDecodeError, IndexError, Exception):
-        pass
+    except json.JSONDecodeError:
+        print(f"\n   ⚠️  JSON parse failed for chunk, raw response: {raw[:120]}")
     return []
 
 
