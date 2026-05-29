@@ -1,45 +1,96 @@
+"""
+Nexus GraphRAG — FastAPI Entry Point
+======================================
+Provides:
+  POST /ask    — ask a financial question, routed via ReAct agent
+  GET  /health — liveness check
+  GET  /docs   — Swagger UI (auto-generated)
+"""
 import sys
-import os
+from pathlib import Path
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+# Make project root importable inside Docker and locally
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT))
+
 from src.chains.hybrid_synthesizer import GraphRAGSynthesizer
 
-# Initialize FastAPI App
+# ---------------------------------------------------------------------------
+# Lifespan — replaces deprecated @app.on_event("startup"/"shutdown")
+# ---------------------------------------------------------------------------
+synthesizer: GraphRAGSynthesizer | None = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global synthesizer
+    print("🚀 Starting Nexus-GraphRAG API...")
+    synthesizer = GraphRAGSynthesizer()   # boots agent, connects to DBs
+    yield
+    # Shutdown
+    if synthesizer:
+        synthesizer.close()
+    print("👋 Nexus-GraphRAG API shut down.")
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
 app = FastAPI(
     title="Nexus-GraphRAG API",
-    description="Enterprise Hybrid Graph-Vector RAG Engine over SEC Financial Filings.",
-    version="1.0.0"
+    description=(
+        "Enterprise Hybrid Graph-Vector RAG Engine over SEC 10-K Financial Filings.\n\n"
+        "Uses **Neo4j** (knowledge graph) + **Qdrant** (vector search) + "
+        "**Groq LLaMA-3.3 70B** (reasoning)."
+    ),
+    version="1.0.0",
+    lifespan=lifespan,
 )
 
-# Global instance of our synthesizer
-synthesizer = None
-
-@app.on_event("startup")
-def startup_event():
-    """Initializes the AI agent when the server starts."""
-    global synthesizer
-    synthesizer = GraphRAGSynthesizer()
-
-# Define Request and Response Schemas
+# ---------------------------------------------------------------------------
+# Schemas
+# ---------------------------------------------------------------------------
 class QueryRequest(BaseModel):
     question: str
-    
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [{
+                "question": "What is the primary business of Apple and what are its key entities?"
+            }]
+        }
+    }
+
 class QueryResponse(BaseModel):
+    question: str
     answer: str
 
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 @app.post("/ask", response_model=QueryResponse, tags=["GraphRAG"])
 def ask_question(request: QueryRequest):
     """
-    Takes a user question, routes it to either Neo4j or Qdrant, and synthesizes an answer.
+    Ask a financial question about Apple or Microsoft's 10-K filings.
+
+    The agent automatically routes to:
+    - **vector_search** for factual / numerical questions
+    - **graph_search** for relationship / entity questions
     """
     if not synthesizer:
-        raise HTTPException(status_code=500, detail="Synthesizer engine not initialized.")
-    
+        raise HTTPException(status_code=503, detail="Synthesizer engine not ready yet.")
     answer = synthesizer.generate_answer(request.question)
-    return QueryResponse(answer=answer)
+    return QueryResponse(question=request.question, answer=answer)
+
 
 @app.get("/health", tags=["System"])
 def health_check():
-    return {"status": "operational", "databases": ["Neo4j", "Qdrant"]}
+    """Liveness check — confirms the API and agent are operational."""
+    return {
+        "status": "operational",
+        "agent": "ready" if synthesizer else "initialising",
+        "databases": ["Neo4j (graph)", "Qdrant (vector)"],
+        "llm": "Groq llama-3.3-70b-versatile",
+    }

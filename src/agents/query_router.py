@@ -52,12 +52,22 @@ GROQ_SLEEP   = 1.5        # seconds between LLM calls (free-tier rate limit)
 def vector_search(query: str, qdrant: QdrantClient, embedder: TextEmbedding,
                   top_k: int = 5) -> str:
     """Semantic similarity search over Qdrant. Returns concatenated text chunks."""
+    from qdrant_client.models import NamedVector, QueryRequest as QdrantQueryRequest
     vector = list(embedder.embed([query]))[0].tolist()
-    results = qdrant.search(
-        collection_name=COLLECTION,
-        query_vector=vector,
-        limit=top_k,
-    )
+    # qdrant-client 1.7+ uses query_points; fall back to search for older versions
+    try:
+        response = qdrant.query_points(
+            collection_name=COLLECTION,
+            query=vector,
+            limit=top_k,
+        )
+        results = response.points
+    except AttributeError:
+        results = qdrant.search(
+            collection_name=COLLECTION,
+            query_vector=vector,
+            limit=top_k,
+        )
     if not results:
         return "No relevant passages found in the vector store."
     passages = []
