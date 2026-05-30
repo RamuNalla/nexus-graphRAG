@@ -16,3 +16,4 @@ QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 
 # LLM Configuration
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
